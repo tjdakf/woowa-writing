@@ -1,253 +1,368 @@
-# 👋 서론
+## 들어가며
 
-주소창에 https://www.blog.naver.com 을 입력하고 검색 버튼을 누르면,
-1초도 안 돼서 네이버 블로그 페이지가 눈앞에 딱! 나타난다.
+개발을 하다 보면 한 번쯤은 Hibernate SQL 로그를 유심히 들여다보게 되는 순간이 있습니다.
 
-우리가 웹 브라우저에서 주소를 입력하고 화면이 뜨는 장면은 너무나 익숙하다.
-하지만 그 짧은 순간, 브라우저와 서버 사이에서는 수많은 네트워크 단계가 동시에 일어나고 있다.
-이 과정은 눈에 보이지 않기 때문에, 심지어 개발자에게도 낯선 영역이다.
+분명 API 한 번만 호출했는데, 콘솔에는 비슷한 쿼리들이 수십 줄씩 반복되어 찍히는 걸 보면서 “왜 이렇게 많은 쿼리가 호출되지?”라는 궁금증이 생깁니다.
 
-이 글은 그런 ‘보이지 않는 내부 과정’이 궁금한 사람들을 위해 작성되었다.
-복잡한 네트워크 구조를 이해하기 쉽게, 간단한 예시와 그림을 곁들인 이론 중심의 글이다.
+저희 프로젝트에서도 같은 일이 있었습니다.
 
-이제 사용자가 URL을 입력한 뒤 브라우저가 서버와 연결되고,
-결국 웹페이지가 화면에 표시되기까지의 여정을 단계별로 따라가 보자.
+GET /contents/keyword API 한 번 호출에 298개의 쿼리가 실행되고 있었습니다. 원인은 JPA의 지연 로딩(Lazy Loading)으로 인해 발생한 N+1 문제였습니다.
 
-<br />
+이 글은 그 문제를 추적하고, Fetch Join → Batch Size → @EntityGraph로 쿼리 개수를 줄이며 성능을 개선해 나간 과정을 기록한 글입니다.
 
-그 전에, 이해를 돕기 위해 먼저 웹에 대해 간단히 짚고 가자!
+## 문제 상황
 
----
+운영 환경에서 API 응답 속도를 모니터링하던 중, 특정 엔드포인트(GET /contents/keyword)의 응답 시간이 다른 API보다 유독 길게 측정되는 현상을 발견했습니다.
 
-# 🌐 웹이란? 웹의 목적?
+처음에는 단순히 데이터 양이나 정렬 조건 때문이라고 생각했지만, 평균 응답 시간이 꾸준히 높게 유지되는 것을 보고 쿼리 레벨에서의 문제를 의심했습니다. 그래서 실제로 쿼리 개수를 측정해보기로 했습니다.
 
-팀 버너스리가 제안한 월드 와이드 웹(World Wide Web)은
-누구나 접근하고 정보를 나눌 수 있는 공간으로 설계되었다.
+```java
+"duration":"633ms","method":"GET","uri":"/contents/keyword"
+```
 
-**즉, 웹의 본질은 정보 공유다.**
+### 쿼리 개수 측정
 
-이를 가능하게 하는 기본 구조는 두 주체로 이루어진다.
-서버(Server) 와 클라이언트(Client) 이다.
+쿼리 개수를 확인하기 위해 Hibernate에서 제공하는 `StatementInspector` 인터페이스를 구현했습니다. 이 인터페이스의 `inspect()` 메서드는 하이버네이트가 실행할 SQL문을 가로채서 실행 전 후처리를 할 수 있도록 도와주는 기능을 제공합니다.
 
-우리가 사용하는 브라우저(Chrome, Safari 등)는 클라이언트의 대표적 형태이며,
-네이버나 구글 같은 웹사이트를 제공하는 시스템이 서버다.
-이 두 주체가 정보를 주고받기 위해서는 서로를 이어주는 통로가 필요하다.
+```java
+@Component
+public class QueryCountInspector implements StatementInspector {
 
-그 통로가 바로 **네트워크(Network)** 다.
+    private final ThreadLocal<QueryCounter> queryCount = new ThreadLocal<>();
 
----
+    public void startCounter() {
+        queryCount.set(new QueryCounter(0L, System.currentTimeMillis()));
+    }
 
-# 🤔 네트워크란?
+    public QueryCounter getQueryCount() {
+        return queryCount.get();
+    }
 
-네트워크의 정의는,
-**두 대 이상의 컴퓨터나 장치가 서로 통신하고, 데이터를 공유할 수 있도록 연결된 상태**이다.
+    public void clearCounter() {
+        queryCount.remove();
+    }
 
-즉, 네트워크는 클라이언트와 서버를 잇는 보이지 않는 다리다.
+    @Override
+    public String inspect(String sql) {
+        QueryCounter queryCounter = queryCount.get();
+        if (queryCounter != null) {
+            queryCounter.increaseCount();
+        }
+        return sql;
+    }
+}
+```
 
-하지만 이 단순한 정의 뒤에는 복잡한 과정이 숨어 있다.
-데이터를 패킷 단위로 나누고, 올바른 주소로 찾아가며, 손실 없이 순서대로 도착하도록 조정하는 체계가 존재한다.
+이렇게 하면 하이버네이트가 실행하는 모든 쿼리의 개수를 측정할 수 있습니다.
 
-즉, 네트워크는 하나의 길이 아니라
-수많은 약속(프로토콜)과 중간 거점(서버, 라우터)들이 얽혀 있는 거대한 시스템이다.
+이를 활용해 하나의 API 요청에서 10개 이상의 쿼리가 발생할 경우 경고 로그를 남기도록 설정했습니다.
 
-<br />
+```java
+if (QueryCountInspector.getCount() > 10) {
+    log.warn("하나의 요청에 쿼리가 10번 이상 발생했습니다. QUERY_COUNT: {}", QueryCountInspector.getCount());
+}
+```
 
-우리는 이 글에서 네트워크의 과정을 살펴볼건데,
-먼저 살펴볼 **브라우저 -> 서버** 흐름을 키워드로 간략하게 표현하면 다음과 같다.
+### 측정 결과
 
-![](https://velog.velcdn.com/images/wndkgus0225/post/6242ba5a-6732-4c02-8474-33b8be05bfa2/image.png)
+쿼리 카운터를 적용한 후 로그를 확인해보니 GET /contents/keyword 요청 한 번에 298개의 쿼리가 실행되고 있었습니다.
 
-브라우저가 URL을 입력받아 화면을 띄우기까지의 모든 과정은 이 네트워크 안에서 이루어지기에,
-네트워크를 이해한다는 것은 웹의 동작 원리를 이해하는 출발점이다.
+```
+"duration":"633ms","method":"GET","uri":"/contents/keyword"
+"message":"하나의 요청에 쿼리가 10번 이상 발생했습니다. QUERY_COUNT: 298","method":"GET","uri":"/contents/keyword"
+```
 
-이제 살펴볼 내용은 위의 키워드가 어떤 흐름으로 가는지에 관한 것이다.
+쿼리가 이렇게 많이 발생한 이유는 JPA의 기본 동작 방식인 지연 로딩 때문이었습니다.
 
-![](https://velog.velcdn.com/images/wndkgus0225/post/6769c872-13be-449d-b591-216f55aaa905/image.png)
+Content → Place → PlaceCategory 로 이어지는 연관관계가 각 엔티티마다 별도의 쿼리를 발생시키며 N+1 문제를 만들고 있었던 것입니다.
 
----
+## N+1 문제란?
 
-# 1. URL 검색
+N+1 문제란, 첫 번째 쿼리(1)의 결과로 N개의 데이터를 가져온 뒤, 연관된 데이터를 조회하기 위해 N개의 추가 쿼리가 실행되는 현상을 말합니다.
 
-사용자가 URL을 검색했을 때,
-브라우저가 가장 먼저 마주하는 것은 사용자가 입력한 URL (Uniform Resource Locator) 이다.
-URL은 단순한 문자열이 아니라, 웹 상의 자원을 정확히 찾아가기 위한 주소 체계이다.
+즉, 한 번의 요청으로 1 + N개의 쿼리가 발생하는 구조입니다. 데이터 양이 많아질수록 이 문제는 기하급수적으로 성능 저하를 일으키게 됩니다.
 
-예시: `https://blog.naver.com:443`
+## 원인 분석
 
-이 주소에는 다음 세 가지 요소가 포함되어 있다.
+저희 프로젝트에서는 장소(`Place`)와 장소의 카테고리(`PlaceCategory`)가 아래와 같이 `@OneToMany` 관계로 설정되어 있고, 지연 로딩이 기본값으로 동작하고 있었습니다.
 
-1. `https`: 프로토콜 - 통신 방식 (HTTP, HTTPS 등)
-2. `blog.naver.com`: 도메인 - 서버의 이름 또는 위치
-3. `:443`: 포트 번호 - 서버 내부의 세부 통신 창구
+```java
+@Entity
+public class Place {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
 
-브라우저는 이 URL을 파싱(Parsing) 하여 각 요소를 분리하고,
-다음 단계에서 사용할 준비를 한다.
+    // @OneToMany의 기본 Fetch 전략은 지연 로딩이다.
+    @OneToMany(mappedBy = "place", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<PlaceCategory> placeCategories = new ArrayList<>();
+    // ...
+}
+```
 
-비유로 설명하자면 **도메인 주소는 건물 주소**,
-**포트 번호는 세부 건물 주소**를 의미한다.
+문제의 API 로직은 다음과 같은 흐름을 가지고 있었습니다.
 
----
+1. Content 목록을 조회
+2. 각 Content에 포함된 Place 목록을 조회
+3. 각 Place의 카테고리(PlaceCategory)를 불러와 화면에 표시
 
-# 2. DNS에 IP 주소 질의
+코드는 단순했지만, 실행 시점에는 다음과 같은 쿼리 패턴이 발생했습니다.
 
-하지만, url에서 파싱해온 도메인(blog.naver.com)은 사람이 읽기 쉽도록 만들어진 이름일 뿐 컴퓨터는 이 문자열을 직접 이해하지 못한다.
+```sql
+// 1. 메인 컨텐츠에 포함된 Place 목록을 조회 (쿼리 1개)
+select p1_0.id, p1_0.name from place p1_0 where p1_0.id in (?, ?, ...);
 
-따라서 브라우저는 이 **도메인을 실제로 연결 가능한 IP 주소로 변환**해야 한다.
+// 2. 조회된 각 Place(N개)의 Category를 얻기 위해 추가 쿼리 발생 (N개)
+Hibernate:
+    select pc1_0.place_id, ... from place_category pc1_0 where pc1_0.place_id=?
+Hibernate:
+    select pc1_0.place_id, ... from place_category pc1_0 where pc1_0.place_id=?
+Hibernate:
+    select pc1_0.place_id, ... from place_category pc1_0 where pc1_0.place_id=?
+... (N번 반복)
+```
 
-이 과정을 담당하는 시스템이 바로 **DNS (Domain Name System)** 이다.
+즉, Place 목록을 한 번에 가져온 뒤, place.getPlaceCategories()가 호출되는 시점마다 추가 쿼리 N개가 실행되었습니다.
 
-![](https://velog.velcdn.com/images/wndkgus0225/post/50e953f2-a0d1-4255-88a4-fb11121a981f/image.png)
+이것이 바로 전형적인 N+1 쿼리 패턴입니다.
 
-브라우저는 DNS 서버에게 요청한다.
+## Fetch 전략
 
-이 탐색은 다음과 같은 순서로 진행된다.
+엔티티의 각 필드에는 JPA가 제공하는 데이터 조회 전략(Fetch) 설정이 가능합니다.
 
-1. 루트 DNS 서버(Root) — .com 등 상위 도메인의 위치를 알려줌
-2. TLD 서버(Top-Level Domain) — naver.com의 위치를 찾아줌
-3. 권한 DNS 서버(Authoritative) — blog.naver.com의 정확한 IP 주소를 응답함
+Fetch 전략에는 Lazy, Eager 2가지가 있습니다.
 
-DNS는 이름 기반 요청을 숫자 기반 주소로 변환한다.
-그리고 브라우저는 이 결과를 캐시에 저장하여 다음 접속 시 더 빠르게 접근할 수 있게 한다.
+### Eager(즉시 로딩)
 
----
+엔티티를 조회할 때 연관된 모든 데이터를 한 번에 가져옵니다. `@ManyToOne`, `@OneToOne`의 기본값입니다. 연관된 데이터가 항상 로드되어 있으므로 나중에 추가 쿼리가 발생하지 않습니다. 하지만 사용하지 않는 데이터까지 조회하여 비효율적일 수 있습니다.
 
-# 3. 포트번호 추출
+### Lazy(지연 로딩)
 
-포트 번호를 추출하는 부분은 간단하다. 예시를 통해 살펴보면,
+연관된 데이터를 실제로 사용할 때까지 조회를 미룹니다. `@OneToMany`, `@ManyToMany`의 기본값입니다. 연관된 데이터를 실제로 조회하기 전에는 프록시(가짜) 객체로 가지고 있고, 실제 사용 시 추가 조회 쿼리가 발생하게 됩니다. 
 
-`https://blog.naver.com:443`
+예를 들어 Place 엔티티를 조회하면, placeCategories 필드는 실제 데이터가 아닌 프록시 객체로 채워집니다. 이후 `place.getPlaceCategories()`처럼 이 필드에 실제로 접근하는 코드가 실행될 때 데이터베이스에 조회를 요청합니다.
 
-이 부분에서 443이 포트 번호이다.
+효율적이지만, 잘못 사용하면 위에서 본 N+1 문제를 유발합니다.
 
-🤔 그런데, 포트 번호를 알아야하는 이유는 무엇일까?
+### 어떤 전략을 선택해야 할까?
 
-하나의 서버(IP)가 여러 서비스를 동시에 제공할 수 있기 때문에,
-**포트 번호는 ‘세부 통신 창구’를 지정한다.**
+즉시 로딩을 사용하면 문제를 피할 수 있을 것 같지만, 실제로는 완벽한 해결책이 아닙니다. 데이터를 조회하면 연관관계가 있는 엔티티는 신경 쓰지 않고, 조회 대상이 되는 엔티티만 즉시 가져옵니다. 조회 대상 엔티티를 가져온 이후 연관된 엔티티가 있다면 그때 연관 엔티티를 즉시 로딩합니다. 지연 로딩과 다르게 프록시 객체를 사용하진 않지만, 결국 N개의 추가 쿼리가 발생하게 됩니다.
 
-개발 과정에서 우리가 자주 마주할 수 있는 포트 번호는
-`https://localhost:3000`
-이는 “내 컴퓨터의 3000번 포트에 있는 웹 서버와 통신하겠다”를 의미한다.
+결국 중요한 것은, 언제 어떻게 연관 데이터를 함께 가져올지를 명시적으로 제어하는 것입니다. 스프링 공식 문서에서도 즉시 로딩보다 지연 로딩을 기본으로 사용하고, 필요에 따라 연관 데이터를 함께 조회하는 방식을 권장합니다.
 
-포트 번호가 명시되지 않았다면, 브라우저는 프로토콜 기본값을 자동으로 사용한다.
-http의 기본 포트는 80, https의 기본 포트는 443이다.
+### 지연 로딩의 N+1 문제 해결법
 
----
+### 1. Fetch Join
 
-# 4. TCP 연결 - 안정적인 통로
+Fetch Join은 연관된 엔티티를 한 번의 쿼리로 함께 가져오도록 지정하는 JPQL 문법입니다. 
 
-우선 TCP가 무엇인지 알아보자.
+> JPA 공식 문서(Hibernate)의 권장 사항
+"Performance tuning is about removing the additional selects. The best way to do that is a JOIN FETCH..." (성능 튜닝은 추가적인 select 구문을 제거하는 것입니다. 이를 위한 최고의 방법은 JOIN FETCH입니다.)
+> 
 
-**서버와 데이터를 주고받기 위해서는 먼저 안정적인 연결 통로**를 만들어야 하는데,
-이 역할을 하는 프로토콜이 바로 **TCP(Transmission Control Protocol)**이다.
+하지만 `@OneToMany` 관계에 Fetch Join을 사용하면 카테시안 곱(Cartesian Product) 문제가 발생할 수 있습니다.
 
-TCP는 데이터의 신뢰성을 보장하기 위해 다음 기능을 수행한다.
+### 카데시안 곱이란?
 
-- 데이터 손실 방지 (패킷 유실 시 재전송)
-- 순서 보장 (Sequence Number로 순서 관리)
-- 흐름 제어 및 혼잡 제어 (네트워크 상태에 따른 조절)
+데이터베이스에서 `JOIN`을 수행할 때, 1(One)에 해당하는 테이블의 행이 N(Many)에 해당하는 테이블의 행 개수만큼 복제되어 결과가 부풀려지는 현상을 말합니다.
 
-<br />
-그런데, 이 쯤에서 드는 생각은
+예를 들어 다음과 같은 테이블이 있다고 가정합니다.
 
-"굳이 TCP라는 길을 만들지 않아도 네트워크 요청은 보낼 수 있지 않나?" 🤔 이다.
+Content 테이블
 
-이런 질문에 대한 해답으로는 TCP 특징을 들 수 있는데,
+| ID | 제목 |
+| --- | --- |
+| 1 | 부산 여행 |
+| 2 | 서울 여행 |
+| 3 | 제주 여행 |
 
-☝️가장 큰 첫 번째 이유는 우리가 가장 많이 사용하는 HTTP 버전이 TCP 위에서 설계되어있기 때문이다.
+ContentPlace 테이블
 
--> HTTP/1.0, 1.1, 2.0 모두 TCP 위에서 동작하며,
-HTTP/3부터는 일부 구조가 UDP 기반으로 확장되었지만 여전히 TCP가 표준이다.
+| ID | 장소명 | content_id |
+| --- | --- | --- |
+| 101 | 해운대 | 1 |
+| 102 | 광안리 | 1 |
+| 201 | 경복궁 | 2 |
+| 202 | 남산타워 | 2 |
+| 203 | 명동 | 2 |
+| 301 | 한라산 | 3 |
 
-✌️ 두 번째 이유로는 TCP는 데이터 손실이나 순서 꼬임을 방지해주기 때문이다.
+이때 `Content`를 기준으로 `ContentPlace`를 `JOIN FETCH` 하는 JPQL을 실행하면, 데이터베이스는 내부적으로 다음과 같은 결과를 만듭니다. (총 2+3+1 = 6행)
 
--> 웹 페이지를 불러올 때, 이미지나 텍스트 조각이 빠지거나 순서가 틀릴 수 있는데 이러면 페이지가 망가지기 때문에 안정적으로 요청과 응답을 주고받을 수 있는 TCP 연결이 꼭 필요하다!
+이제 페이지 크기(size)를 2로 설정하여 첫 페이지를 조회한다고 가정해 봅시다. 개발자의 의도는 `Content` 2개, 즉 "부산 여행"과 "서울 여행"을 받아보는 것입니다.
 
-<br />
+하지만 데이터베이스는 `LIMIT 2`와 같은 페이징 쿼리를 위 `JOIN FETCH` 결과 테이블에 그대로 적용합니다.
 
-이 TCP 연결을 위해 우리는 **3-Way Handshake**를 하는 것이다.
+이 결과를 받은 JPA(하이버네이트)는 `content.id`가 1인 `Content` 객체 하나와, 그에 속한 `ContentPlace` 2개를 만들어 애플리케이션에 반환합니다.
 
-1. SYN — 브라우저 → 서버: “연결하고 싶어, 내 번호는 100이야.”
-2. SYN + ACK — 서버 → 브라우저: “좋아, 내 번호는 200이야.”
-3. ACK — 브라우저 → 서버: “너 것도 잘 받았어. 연결하자!”
+결과적으로, 개발자는 `Content` 2개를 기대했지만 실제로는 `Content` 1개("부산 여행")만 받게 됩니다. 이처럼 `@OneToMany` Fetch Join에서 페이징을 사용하면 데이터가 누락되는 문제가 발생합니다.
 
-![](https://velog.velcdn.com/images/wndkgus0225/post/512beb09-dd8d-40e2-a516-1a52c0761046/image.png)
+이러한 위험을 인지하고 있는 하이버네이트는, `@OneToMany` Fetch Join과 페이징을 함께 사용할 경우 경고 로그를 출력합니다.
 
-이 세 단계를 통해 양측은 데이터를 주고받을 수 있는 논리적 통로(Connection)를 확보한다.
+```
+WARN: HHH000104: firstResult/maxResults specified with collection fetch; applying in memory!
 
-TCP 연결로 데이터를 주고받을 수 있는 길을 확보하였기 때문에 HTTP 요청과 응답을 자유롭게 할 수 있다!
+```
 
----
+이 경고는 "컬렉션 fetch와 페이징을 함께 사용했으므로, DB 페이징을 포기하고 모든 결과를 메모리에 올린 후 애플리케이션 레벨에서 페이징하겠다"는 의미입니다. 위 예시에서는 6행의 데이터를 모두 DB에서 가져온 후, 메모리에서 2개의 `Content`를 추려내는 방식입니다.
 
-# 5. TLS 연결 - 안전한 통로
+데이터가 적을 때는 문제가 없어 보일 수 있지만, `Content`가 1,000개이고 각각 10개의 `ContentPlace`를 가진다면 총 10,000개의 행이 메모리에 로드되어 `OutOfMemoryError` 가 발생하게 됩니다.
 
-우리는 아까 HTTP 요청과 응답을 받을 수 있는 상태인 TCP 연결을 했다.
-하지만, 우리가 접속할 사이트를 보면, `https://blog.naver.com:443` http가 아닌 https를 연결해야 하는데, 먼저 이 둘의 차이점을 한 번 살펴보자!
+### 2. Batch Size
 
-![](https://velog.velcdn.com/images/wndkgus0225/post/0dc52109-0475-48e6-822d-cbf7b57811fe/image.png)
+이 때 `Batch Size` 옵션을 고려할 수 있습니다. `Batch Size` 옵션은 하이버네이트의 어노테이션을 사용하여 한 번에 조회할 데이터의 크기를 설정하는 방법입니다.
 
-다음 상황은 사용자가 브라우저에 비밀번호를 입력하고, 이 비밀번호가 웹 서버로 넘어가는 과정을 모식화해보았다.
+지연 로딩된 데이터를 초기화할 때, 한 번에 하나의 엔티티가 아닌, 지정된 `size`만큼의 ID를 모아 `IN` 절 쿼리로 한 번에 조회합니다.
 
-1. HTTP를 사용하는 경우에는 암호화가 전혀 되지 않기 때문에, 네트워크 중간에 있는 해커가 비밀번호를 그대로 가로채 볼 수 있다.
+- `application.yml`에 글로벌 설정을 추가하거나, 엔티티 필드에 `@BatchSize` 어노테이션을 붙입니다.
+    
+    ```yaml
+    spring:
+      jpa:
+        properties:
+          hibernate:
+            default_batch_fetch_size: 100
+    
+    ```
+    
+- `size=100`일 때, 20개의 `Place`에 대한 `PlaceCategory`가 필요하다면, `WHERE place_id IN (?, ?, ...)` 쿼리 한 개로 모든 카테고리 정보를 가져옵니다.
+- Fetch Join의 페이징 문제를 완벽하게 해결하면서, N개의 쿼리를 단 1개의 추가 쿼리로 줄여줍니다.
 
-2. 반면 HTTPS를 사용하면, 전송 과정에서 TLS 프로토콜을 통해 비밀번호가 암호화되어 전달된다.
+대부분의 주요 데이터베이스(MySQL, PostgreSQL 등)는 IN 절에 수천 개 이상의 값을 허용하기 때문에 Batch Size는 일반적으로 10에서 100사이 값을 많이 사용합니다.
 
-따라서 해커가 중간에서 데이터를 훔치더라도 암호화된 형태만 볼 수 있어 실제 내용을 알아내기 어렵다.
+## 적용하기
 
-그래서 보안 계층이라고 하는 TLS는 미리 만들어둔 통로인 TCP 위에 얹어지는 형태이다.
-즉, TCP는 데이터를 안전하게 잘 전달해주는 길이고, TLS는 그 위에 덧씌워진 보안 계층이다.
-<br />
+`FetchType.LAZY`옵션을 지정하여 조회 전략을 지연 로딩으로 변경하고, `default_batch_fetch_size` 를 100으로 설정한 후 다시 API를 호출하니 쿼리 개수가 7개로 줄어들었습니다.
 
-TLS는 TCP와 마찬가지로 handShake 과정을 거치는데,
+```java
+"QUERY_COUNT: 7", "method":"GET","uri":"/contents/keyword"
+"duration":"216ms","method":"GET","uri":"/contents/keyword"
+```
 
-![](https://velog.velcdn.com/images/wndkgus0225/post/2b3a7180-f95d-4669-b907-45a1c961c9ec/image.png)
+```java
+// 1. 특정 Content에 속한 모든 ContentPlace 목록을 조회합니다.
+Hibernate: 
+    select
+        cp1_0.id,
+        cp1_0.content_id,
+        ...
+    from
+        content_place cp1_0 
+    left join
+        content c1_0 
+            on c1_0.id=cp1_0.content_id 
+    where
+        c1_0.id=?
 
-1. 브라우저가 “안전하게 통신하고 싶어!” 요청
-2. 서버가 SSL 인증서(CA가 발급)를 전달
-3. 브라우저가 인증서 검증 후 키 교환 정보 생성
-4. 공개키/비공개키 방식을 이용해 대칭키를 안전하게 합의
-5. 이후 모든 데이터는 이 대칭키로 암호화되어 전송됨
+// 2. 위에서 조회된 ContentPlace 목록(N개)에 대해 연관된 Place 정보를 조회합니다.
+Hibernate: 
+    select
+        p1_0.id,
+        p1_0.address,
+        ... 
+    from
+        place p1_0 
+// default_batch_fetch_size=100 설정으로 인해, N개의 쿼리가 아닌 한 개의 'IN'절 쿼리로 모든 Place 정보를 한 번에 가져옵니다.
+    where
+        p1_0.id in (?, ?, ?, ? ... ?, ?, ?, ?, ?)   
+```
 
-즉, **TLS = TCP의 신뢰성 + 보안성**
+## @EntityGraph
 
-TLS 연결을 통해 데이터를 주고받을 수 있는 길을 확보하였다.
-따라서 이제 HTTPS 요청과 응답이 가능해진 것이다!
+저희 프로젝트 대부분의 화면에서는 Content를 조회할 때 항상 Creator와 City 정보가 함께 필요했습니다.
+이 경우, `batch_fetch_size` 설정만으로는, `Content` 목록을 조회한 후 `creator`와 `city` 정보에 접근할 때 매번 Lazy Loading으로 인해 IN 쿼리가 두 번씩 발생했죠.
 
-<br />
-모든 통로가 연결되었기에 드디어 브라우저로부터 get 요청을 웹 서버로 보낼 수 있다!
+```java
+@Entity
+public class Content {
+    // ...
+    @ManyToOne(fetch = FetchType.LAZY)(fetch =FetchType.LAZY)
+    @JoinColumn(name = "creator_id")
+    private Creator creator;
 
-![](https://velog.velcdn.com/images/wndkgus0225/post/8a29c8f7-4ed1-49e5-88a6-2a32b6e1a811/image.png)
+    @ManyToOne(fetch = FetchType.LAZY)(fetch =FetchType.LAZY)
+    @JoinColumn(name = "city_id")
+    private City city;
+    // ...
+}
+```
 
----
+이러한 경우 `@EntityGraph` 를 사용할 수 있습니다. 
 
-# 6. Request & Response
+`@EntityGraph`는 특정 쿼리를 실행할 때, 지연 로딩으로 설정된 연관관계를 즉시 로딩하도록 만들어줍니다. JPQL의 `JOIN FETCH`와 유사한 역할을 하지만, 더 간결하고 재사용성이 높다는 장점이 있습니다.
 
-모든 준비가 끝난 브라우저는 서버로 **HTTP 요청(Request)** 을 보낸다.
+```java
+@EntityGraph(attributePaths = {"creator", "city"}, type = EntityGraph.EntityGraphType.FETCH)
+Slice<Content> findByCityName(...);
+```
 
-서버는 내부 로직을 수행하고 결과를 **HTTP 응답(Response)** 으로 돌려준다.
+- `@EntityGraph(attributePaths = {"creator", "city"})`: `Content`를 조회할 때, `creator`와 `city` 필드를 함께 `JOIN`하여 가져오도록 지정합니다.
+- `type = EntityGraph.EntityGraphType.FETCH`: `attributePaths`에 명시된 속성은 EAGER로, 나머지 속성은 엔티티에 명시된 기본 Fetch 전략(LAZY)을 따릅니다.
+- * `type = EntityGraph.EntityGraphType.LOAD`는 명시된 속성만 EAGER, 나머지는 기본 EAGER 전략을 따릅니다.
 
-응답에는 HTML, CSS, JavaScript, 이미지 등 다양한 콘텐츠가 포함된다.
-브라우저는 이를 해석하고 필요한 추가 리소스를 다시 요청한다.
-<br />
+`@EntityGraph` 적용 후, Hibernate는 단 하나의 `JOIN` 쿼리를 생성하여 모든 정보를 한 번에 가져옵니다.
 
-이 과정을 거쳐 최종적으로 화면에 보이는 **웹 페이지가 렌더링(Rendering)** 된다.
+```sql
+-- @EntityGraph 적용 후 실행되는 쿼리
+SELECT c.id,
+       c.title, ...,     -- Content 필드
+    cr.id, cr.name, ..., -- Creator 필드
+    ci.id, ci.name, ...  -- City 필드
+    FROM
+    content c
+    LEFT OUTER JOIN
+    creator cr
+ON c.creator_id=cr.id
+    LEFT OUTER JOIN
+    city ci ON c.city_id=ci.id
+WHERE
+    c.city_name = ?
+  AND c.id
+    < ?
+ORDER BY
+    c.id DESC
 
----
+```
 
-# 👀 마무리 - 우리가 체감하지 못하는 찰나의 과정
+## 부하테스트
 
-이 모든 단계는 사용자가 검색 버튼을 클릭한 후
-수백 밀리초(ms) 내에 수행된다.
+@BatchSize와 @EntityGraph 적용 전후의 성능 변화를 수치로 확인하기 위해 k6로 부하 테스트를 진행했습니다.
 
-즉, 우리가 ‘순식간에 뜨는 웹페이지’를 보는 그 순간,
-브라우저는 수십 개의 요청과 응답, 수천 번의 연산을 동시에 처리하고 있는 것이다.
-<br />
+테스트는 동일한 조건(100 VUs, 10초 동안, 요청 100회)에서 수행되었습니다.
 
-**결국, 웹은 단순한 기술의 조합이 아니라
-“정보를 안전하게 공유하기 위한 인간과 기계의 협력 체계” 다.**
+```java
+import http from "k6/http";
+import { sleep } from "k6";
 
-브라우저와 서버는 오늘도 그 협력을 이어가며,
-우리에게 매 순간 빠르고 믿을 수 있는 정보를 전달한다!
+export const options = {
+	vus: 100, // 동시에 100명 가상 유저
+	duration: "10s", // 총 10초 동안 실행
+	iterations: 100, // 총 100번만 실행 (유저 1번씩)
+};
 
-<br />
+export default function () {
+	let params = {
+		headers: {
+			"...",
+		},
+	};
+	http.get("...", params);
+	sleep(1);
+}
+```
 
-> 출처: 모두의 네트워크, 미즈구치 카츠야, 도서출판 길벗, 2018년
+테스트 결과는 평균 응답시간(avg), 95% 응답시간(p95), 초당 요청 수(throughput) 를 중심으로 비교했습니다.
+
+| 구분 | 평균 응답시간 (avg) | 95% 응답시간 (p95) | 초당 요청 수 (http_reqs/s) |
+| --- | --- | --- | --- |
+| 개선 전 | 715.55 ms | 1.14 s | 46.46 /s |
+| Batch Size, Lazy Loading 적용 | 492.73 ms | 798.49 ms | 55.38 /s |
+| @EntityGraph 적용 | 270.84 ms | 418.03 ms | 69.99 /s |
+
+즉, N+1 문제를 해결하면서 단순히 쿼리 수만 줄어든 것이 아니라, 전체 API 응답 속도와 서버 처리 효율이 모두 개선되었음을 확인할 수 있었습니다.
+
+## 마무리하며
+
+즉시 로딩(EAGER)은 단기적으로 편해 보이지만, 결국 불필요한 데이터 로드로 성능을 악화시킵니다. 반대로 지연 로딩(LAZY)은 효율적이지만, 무의식적인 접근 한 줄이 수백 개의 쿼리를 만들 수 있습니다.
+
+N+1 문제는 단순히 쿼리가 많이 나가는 현상이 아니라, 데이터를 언제, 어떻게 불러올지에 대한 설계의 영역이 될 수 있다는 걸 느꼈습니다.
